@@ -13,6 +13,9 @@ from sim.generators import generate_scenario_steps
 
 
 def run_benchmark(config: BenchmarkConfig) -> BenchmarkResult:
+    if getattr(config, "stress_mode", None) or getattr(config, "llm_mode", "mock") != "mock":
+        from bench.suite_runner import run_single_with_stress
+        return run_single_with_stress(config)
     scenario = generate_scenario_steps(config.scenario_type, config.number_of_days, config.seed)
     runner = AgentRunner(
         policy_name=config.policy,
@@ -23,7 +26,8 @@ def run_benchmark(config: BenchmarkConfig) -> BenchmarkResult:
         rehearsal_frequency=config.rehearsal_frequency,
     )
     hints = [gt.gold_answer for gt in scenario.ground_truth]
-    llm = get_llm(use_mock=config.use_mock_llm, ground_truth_hints=hints)
+    llm_mode = getattr(config, "llm_mode", "mock" if config.use_mock_llm else "real")
+    llm = get_llm(use_mock=config.use_mock_llm, ground_truth_hints=hints, llm_mode=llm_mode, seed=config.seed)
     runner.set_llm(llm)
     runner.reset_state()
 
@@ -60,7 +64,7 @@ def run_benchmark(config: BenchmarkConfig) -> BenchmarkResult:
             + len(runner.state.procedural.list_items())
         )
 
-    return BenchmarkResult(
+    result = BenchmarkResult(
         config=config,
         accuracy=metrics["accuracy"],
         citation_precision=metrics["citation_precision"],
@@ -73,6 +77,12 @@ def run_benchmark(config: BenchmarkConfig) -> BenchmarkResult:
         run_records=records,
         run_id=str(uuid.uuid4())[:8],
     )
+    try:
+        from bench.metrics_v2 import compute_metrics_v2
+        result.metrics_v2 = compute_metrics_v2(result)
+    except Exception:
+        pass
+    return result
 
 
 def save_result(result: BenchmarkResult, out_dir: str = "data/runs") -> str:
@@ -103,14 +113,62 @@ def save_result(result: BenchmarkResult, out_dir: str = "data/runs") -> str:
         "run_records": [
             {"day": r.day, "turn": r.turn, "question": r.question, "gold_answer": r.gold_answer,
              "answer": r.answer, "citations": r.citations, "gold_fact_ids": r.gold_fact_ids,
-             "correct": r.correct, "citation_precision": r.citation_precision, "citation_recall": r.citation_recall,
+             "retrieved": r.retrieved, "correct": r.correct, "citation_precision": r.citation_precision, "citation_recall": r.citation_recall,
              "latency_retrieve_s": r.latency_retrieve_s, "latency_llm_s": r.latency_llm_s}
             for r in result.run_records
         ],
+        "metrics_v2": result.metrics_v2,
     }
     with open(path, "w") as f:
         json.dump(data, f, indent=2)
     return path
+
+
+def load_result(path: str) -> BenchmarkResult:
+    """Load a BenchmarkResult from JSON file."""
+    import json
+    with open(path) as f:
+        data = json.load(f)
+    config = BenchmarkConfig(
+        scenario_type=data["config"]["scenario_type"],
+        policy=data["config"]["policy"],
+        seed=data["config"].get("seed"),
+        number_of_days=data["config"].get("number_of_days", 7),
+        wm_size=data["config"].get("wm_size", 10),
+        top_k=data["config"].get("top_k", 5),
+        decay_lambda=data["config"].get("decay_lambda", 0.1),
+        salience_threshold=data["config"].get("salience_threshold", 0.3),
+        rehearsal_frequency=data["config"].get("rehearsal_frequency", 3),
+        use_mock_llm=data["config"].get("use_mock_llm", True),
+    )
+    records = []
+    for r in data.get("run_records", []):
+        raw_ret = r.get("retrieved", [])
+        if raw_ret and isinstance(raw_ret[0], (list, tuple)):
+            retrieved = [(x[0], x[1], float(x[2]) if len(x) > 2 else 0.0) for x in raw_ret]
+        else:
+            retrieved = []
+        records.append(RunRecord(
+            day=r["day"], turn=r["turn"], question=r.get("question"), gold_answer=r.get("gold_answer"),
+            answer=r.get("answer", ""), citations=r.get("citations", []), gold_fact_ids=r.get("gold_fact_ids", []),
+            retrieved=retrieved,
+            correct=r.get("correct", False), citation_precision=r.get("citation_precision", 0), citation_recall=r.get("citation_recall", 0),
+            latency_retrieve_s=r.get("latency_retrieve_s", 0), latency_llm_s=r.get("latency_llm_s", 0),
+        ))
+    return BenchmarkResult(
+        config=config,
+        accuracy=data["accuracy"],
+        citation_precision=data["citation_precision"],
+        citation_recall=data["citation_recall"],
+        hallucination_rate=data["hallucination_rate"],
+        memory_items_stored=data["memory_items_stored"],
+        token_estimate=data["token_estimate"],
+        retrieval_latency_avg_s=data["retrieval_latency_avg_s"],
+        forgetting_curve=[(x[0], x[1]) for x in data["forgetting_curve"]],
+        run_records=records,
+        run_id=data.get("run_id"),
+        metrics_v2=data.get("metrics_v2"),
+    )
 
 
 def result_to_dataframe(result: BenchmarkResult):

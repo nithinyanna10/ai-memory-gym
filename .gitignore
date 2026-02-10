@@ -8,6 +8,8 @@ dist/
 build/
 data/runs/*.json
 data/runs/*.csv
+data/runs/*.parquet
+data/runs/cache/
 !data/runs/.gitkeep
 .env
 .venv/

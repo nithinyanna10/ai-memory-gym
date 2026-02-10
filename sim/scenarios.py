@@ -5,10 +5,10 @@ from typing import Optional
 from sim.base import Scenario, ScenarioStep, GroundTruth, BaseScenario
 
 
-def _make_step(day: int, turn: int, event: str, question: Optional[str] = None, gold: Optional[str] = None, fact_ids: Optional[list[str]] = None) -> ScenarioStep:
+def _make_step(day: int, turn: int, event: str, question: Optional[str] = None, gold: Optional[str] = None, fact_ids: Optional[list[str]] = None, tags: Optional[dict] = None) -> ScenarioStep:
     return ScenarioStep(
         day=day, turn=turn, event_text=event,
-        question=question, gold_answer=gold, gold_fact_ids=fact_ids or [],
+        question=question, gold_answer=gold, gold_fact_ids=fact_ids or [], tags=tags,
     )
 
 
@@ -118,10 +118,105 @@ class OpsScenario(BaseScenario):
         return Scenario(name="ops", steps=steps, ground_truth=gt)
 
 
+class SalesCRMScenario(BaseScenario):
+    """Customer requirements across calls; recall constraints later."""
+
+    def generate(self, num_days: int, seed: Optional[int] = None) -> Scenario:
+        rng = random.Random(seed)
+        steps = []
+        gt = []
+        turn = 0
+        steps.append(_make_step(1, 1, "Call with Acme Corp: They need API rate limit of 1000/min.", tags={"constraint": True}))
+        steps.append(_make_step(1, 2, "Acme Corp: Budget cap $20k for Q1."))
+        steps.append(_make_step(2, 3, "Email from Acme: Prefer Slack integration."))
+        turn = 3
+        for d in range(3, min(6, num_days + 1)):
+            steps.append(_make_step(d, turn + 1, f"Check-in day {d}: no new constraints."))
+            turn += 1
+        q_day = min(6, num_days)
+        steps.append(_make_step(q_day, turn + 1, "Question: What is Acme's API rate limit requirement?",
+                                question="What is Acme's API rate limit requirement?", gold="1000/min", fact_ids=[]))
+        gt.append(GroundTruth(question_id="q_rate", question="What is Acme's API rate limit requirement?",
+                              gold_answer="1000/min", gold_fact_ids=[], day_asked=q_day, day_introduced=1))
+        return Scenario(name="sales_crm", steps=steps, ground_truth=gt)
+
+
+class LegalContractScenario(BaseScenario):
+    """Clauses, versions, redlines; gotcha traps."""
+
+    def generate(self, num_days: int, seed: Optional[int] = None) -> Scenario:
+        rng = random.Random(seed)
+        steps = []
+        gt = []
+        steps.append(_make_step(1, 1, "Contract v1: Liability cap is $500k."))
+        steps.append(_make_step(2, 2, "Redline: Liability cap changed to $1M in Section 4.2."))
+        steps.append(_make_step(3, 3, "Final signed: Section 4.2 liability cap $1M."))
+        q_day = min(5, num_days)
+        steps.append(_make_step(q_day, 4, "Question: What is the signed liability cap?",
+                                question="What is the signed liability cap?", gold="$1M", fact_ids=[]))
+        gt.append(GroundTruth(question_id="q_liability", question="What is the signed liability cap?",
+                              gold_answer="$1M", gold_fact_ids=[], day_asked=q_day, day_introduced=3))
+        return Scenario(name="legal_contract", steps=steps, ground_truth=gt)
+
+
+class MeetingMemoryScenario(BaseScenario):
+    """Action items across meetings; later asked what we decided."""
+
+    def generate(self, num_days: int, seed: Optional[int] = None) -> Scenario:
+        rng = random.Random(seed)
+        steps = []
+        gt = []
+        steps.append(_make_step(1, 1, "Meeting 1: Action item - Sarah to own the dashboard by Friday."))
+        steps.append(_make_step(2, 2, "Meeting 2: We decided to use Postgres for the new service."))
+        steps.append(_make_step(3, 3, "Standup: Dashboard delayed to next week."))
+        q_day = min(5, num_days)
+        steps.append(_make_step(q_day, 4, "Question: What did we decide about the database for the new service?",
+                                question="What did we decide about the database for the new service?", gold="Postgres", fact_ids=[]))
+        gt.append(GroundTruth(question_id="q_db", question="What did we decide about the database for the new service?",
+                              gold_answer="Postgres", gold_fact_ids=[], day_asked=q_day, day_introduced=2))
+        return Scenario(name="meeting_memory", steps=steps, ground_truth=gt)
+
+
+class MultiAgentHandoffScenario(BaseScenario):
+    """Agent A stores memory; agent B must retrieve (same scenario, two phases)."""
+
+    def generate(self, num_days: int, seed: Optional[int] = None) -> Scenario:
+        steps = []
+        gt = []
+        steps.append(_make_step(1, 1, "Agent A stores: Customer ticket #4421 resolution = refund approved."))
+        steps.append(_make_step(1, 2, "Handoff to Agent B."))
+        steps.append(_make_step(2, 3, "Agent B is asked: Was ticket #4421 refund approved?",
+                                question="Was ticket #4421 refund approved?", gold="yes", fact_ids=[]))
+        gt.append(GroundTruth(question_id="q_4421", question="Was ticket #4421 refund approved?",
+                              gold_answer="yes", gold_fact_ids=[], day_asked=2, day_introduced=1))
+        return Scenario(name="multi_agent_handoff", steps=steps, ground_truth=gt)
+
+
+class AdversarialInjectionScenario(BaseScenario):
+    """Someone says false fact later; does agent overwrite?"""
+
+    def generate(self, num_days: int, seed: Optional[int] = None) -> Scenario:
+        rng = random.Random(seed)
+        steps = []
+        gt = []
+        steps.append(_make_step(1, 1, "Fact: The launch date is March 15."))
+        steps.append(_make_step(2, 2, "Someone says: Actually the launch date is March 1.", tags={"contradiction": True}))
+        steps.append(_make_step(3, 3, "Question: When is the launch date?",
+                                question="When is the launch date?", gold="March 15", fact_ids=[]))
+        gt.append(GroundTruth(question_id="q_launch", question="When is the launch date?",
+                              gold_answer="March 15", gold_fact_ids=[], day_asked=3, day_introduced=1))
+        return Scenario(name="adversarial_injection", steps=steps, ground_truth=gt)
+
+
 def get_scenario(scenario_type: str) -> BaseScenario:
     m = {
         "personal_assistant": PersonalAssistantScenario(),
         "research": ResearchScenario(),
         "ops": OpsScenario(),
+        "sales_crm": SalesCRMScenario(),
+        "legal_contract": LegalContractScenario(),
+        "meeting_memory": MeetingMemoryScenario(),
+        "multi_agent_handoff": MultiAgentHandoffScenario(),
+        "adversarial_injection": AdversarialInjectionScenario(),
     }
     return m.get(scenario_type, PersonalAssistantScenario())

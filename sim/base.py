@@ -13,6 +13,7 @@ class ScenarioStep:
     question: Optional[str] = None
     gold_answer: Optional[str] = None
     gold_fact_ids: Optional[list[str]] = None
+    tags: Optional[dict] = None  # e.g. {"pii": True, "secret": True, "constraint": True, "contradiction": True}
 
 
 @dataclass

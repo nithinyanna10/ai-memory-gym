@@ -129,7 +129,6 @@ def m_score(
 def compute_metrics_v2(result: BenchmarkResult) -> dict:
     """Compute all V2 metrics for a BenchmarkResult."""
     records = result.run_records
-    q_records = [r for r in records if r.question]
     forgetting = result.forgetting_curve
 
     half_life = retention_half_life(forgetting)

@@ -28,6 +28,8 @@ class StepOutput:
     retrieved: list[tuple[str, str, float]]
     latency_retrieve_s: float = 0.0
     latency_llm_s: float = 0.0
+    prompt_text: Optional[str] = None
+    memory_updates: Optional[list[dict]] = None  # [{"id": str, "text_snippet": str}]
 
 
 class AgentRunner:
@@ -112,6 +114,7 @@ class AgentRunner:
         )
         self.state.episodic.store(ep_item)
         self.state.working.store(ep_item)
+        memory_updates = [{"id": ep_item.id, "text_snippet": (ep_item.text or "")[:200]}]
 
         citations = []
         for r in results:
@@ -136,4 +139,6 @@ class AgentRunner:
             retrieved=retrieved_log,
             latency_retrieve_s=latency_retrieve,
             latency_llm_s=latency_llm,
+            prompt_text=prompt,
+            memory_updates=memory_updates,
         )

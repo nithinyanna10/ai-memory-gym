@@ -16,45 +16,55 @@ from bench.schemas import (
 )
 from bench.runner import run_benchmark, save_result
 from bench.metrics_v2 import compute_metrics_v2
+from bench.experiment_config import stable_config_hash
+from bench.artifacts import write_run_artifacts
 from sim.generators import generate_scenario_steps
 from sim.stress import distraction_flood, contradiction_injection, distribution_shift, memory_corruption
 from agent.runner import AgentRunner, StepInput
 from agent.llm import get_llm
 from bench.metrics import answer_correct, citation_precision, citation_recall
+from bench.logging_utils import set_run_log_path, clear_run_log_path, run_log
 
 
 def _config_hash(config: BenchmarkConfig) -> str:
     d = {
-        "scenario": config.scenario_type,
+        "scenario_type": config.scenario_type,
         "policy": config.policy,
         "seed": config.seed,
-        "days": config.number_of_days,
-        "stress": config.stress_mode,
-        "stress_kwargs": config.stress_kwargs,
-        "llm_mode": config.llm_mode,
-        "wm": config.wm_size,
+        "number_of_days": config.number_of_days,
+        "wm_size": config.wm_size,
         "top_k": config.top_k,
+        "llm_mode": getattr(config, "llm_mode", "mock"),
+        "stress_mode": getattr(config, "stress_mode", None),
+        "stress_kwargs": getattr(config, "stress_kwargs", {}),
     }
-    return hashlib.sha256(json.dumps(d, sort_keys=True).encode()).hexdigest()[:16]
+    return stable_config_hash(d)
 
 
 def _apply_stress(scenario, config: BenchmarkConfig):
     from sim.base import Scenario
     s = scenario
+    kw = config.stress_kwargs
     if config.stress_mode == "distraction_flood":
-        k = config.stress_kwargs.get("k_noise", 5)
-        s = distraction_flood(s, k_noise=k, seed=config.seed)
+        k = kw.get("k_noise", 5)
+        sim = kw.get("similarity_to_target", 0.0)
+        s = distraction_flood(s, k_noise=k, seed=config.seed, similarity_to_target=sim)
     elif config.stress_mode == "contradiction_injection":
-        p = config.stress_kwargs.get("p_contradict", 0.5)
-        s = contradiction_injection(s, p_contradict=p, seed=config.seed)
+        p = kw.get("p_contradict", 0.5)
+        targeted = kw.get("targeted", True)
+        s = contradiction_injection(s, p_contradict=p, seed=config.seed, targeted=targeted)
     elif config.stress_mode == "distribution_shift":
-        day = config.stress_kwargs.get("style_switch_day", 2)
-        s = distribution_shift(s, style_switch_day=day)
+        day = kw.get("style_switch_day", 2)
+        shift_style = tuple(kw.get("shift_style", ("slack", "formal", "noisy")))
+        s = distribution_shift(s, style_switch_day=day, shift_style=shift_style, seed=config.seed)
     return s
 
 
-def run_single_with_stress(config: BenchmarkConfig) -> BenchmarkResult:
+def run_single_with_stress(config: BenchmarkConfig, run_id: Optional[str] = None) -> BenchmarkResult:
     """Run one benchmark, applying stress to scenario; optional memory corruption during run."""
+    if run_id is None:
+        run_id = str(uuid.uuid4())[:8]
+    run_log("run_start", run_id=run_id, scenario_type=config.scenario_type, policy=config.policy, seed=config.seed, stress_mode=getattr(config, "stress_mode", None))
     scenario = generate_scenario_steps(config.scenario_type, config.number_of_days, config.seed)
     scenario = _apply_stress(scenario, config)
 
@@ -95,9 +105,13 @@ def run_single_with_stress(config: BenchmarkConfig) -> BenchmarkResult:
             citation_precision=citation_precision(out.citations, gold_ids),
             citation_recall=citation_recall(out.citations, gold_ids),
             latency_retrieve_s=out.latency_retrieve_s, latency_llm_s=out.latency_llm_s,
+            prompt_text=getattr(out, "prompt_text", None),
+            memory_updates=getattr(out, "memory_updates", None),
         ))
         if do_corruption and runner.state:
-            memory_corruption(runner.state, p_drop=p_drop, p_mutate=p_mutate, seed=(config.seed or 0) + i)
+            mutate_strength = config.stress_kwargs.get("mutate_strength", 1.0)
+            memory_corruption(runner.state, p_drop=p_drop, p_mutate=p_mutate, seed=(config.seed or 0) + i, mutate_strength=mutate_strength)
+        run_log("step", run_id=run_id, step_index=i, day=step.day, turn=step.turn, correct=answer_correct(step.gold_answer, out.answer))
 
     from bench.metrics import compute_metrics
     metrics = compute_metrics(records)
@@ -121,9 +135,10 @@ def run_single_with_stress(config: BenchmarkConfig) -> BenchmarkResult:
         retrieval_latency_avg_s=metrics["retrieval_latency_avg_s"],
         forgetting_curve=metrics["forgetting_curve"],
         run_records=records,
-        run_id=str(uuid.uuid4())[:8],
+        run_id=run_id,
     )
     result.metrics_v2 = compute_metrics_v2(result)
+    run_log("run_end", run_id=run_id, accuracy=result.accuracy, token_estimate=total_tokens, memory_items_stored=mem_count, m_score=result.metrics_v2.get("m_score") if result.metrics_v2 else None)
     return result
 
 
@@ -149,6 +164,8 @@ def run_suite(suite_config: SuiteRunConfig, out_dir: str = "data/runs", use_cach
                     )
                     ch = _config_hash(config)
                     cache_path = Path(out_dir) / "cache" / f"{ch}.json"
+                    run_dir = Path(out_dir) / "runs"
+                    cached_run = False
                     if use_cache and cache_path.exists():
                         try:
                             with open(cache_path) as f:
@@ -160,23 +177,36 @@ def run_suite(suite_config: SuiteRunConfig, out_dir: str = "data/runs", use_cach
                                 result = load_result(str(run_file))
                                 if not result.metrics_v2 and cdata.get("metrics_v2"):
                                     result.metrics_v2 = cdata["metrics_v2"]
+                                run_dir_this = run_dir / run_id
+                                if not (run_dir_this / "manifest.json").exists():
+                                    write_run_artifacts(result, str(run_dir_this), cached=True)
                                 results.append(result)
+                                cached_run = True
                                 continue
                         except Exception:
                             pass
-                    result = run_single_with_stress(config)
-                    results.append(result)
-                    save_result(result, out_dir)
-                    if use_cache:
-                        cache_path.parent.mkdir(parents=True, exist_ok=True)
-                        with open(cache_path, "w") as f:
-                            json.dump({
-                                "run_id": result.run_id,
-                                "config_hash": ch,
-                                "accuracy": result.accuracy,
-                                "m_score": result.metrics_v2.get("m_score") if result.metrics_v2 else None,
-                                "metrics_v2": result.metrics_v2,
-                            }, f, indent=2)
+                    if not cached_run:
+                        run_id_new = str(uuid.uuid4())[:8]
+                        run_dir_this = run_dir / run_id_new
+                        run_dir_this.mkdir(parents=True, exist_ok=True)
+                        set_run_log_path(str(run_dir_this / "run.log"))
+                        try:
+                            result = run_single_with_stress(config, run_id=run_id_new)
+                            results.append(result)
+                            save_result(result, out_dir)
+                            write_run_artifacts(result, str(run_dir_this), cached=False)
+                        finally:
+                            clear_run_log_path()
+                        if use_cache:
+                            cache_path.parent.mkdir(parents=True, exist_ok=True)
+                            with open(cache_path, "w") as f:
+                                json.dump({
+                                    "run_id": result.run_id,
+                                    "config_hash": ch,
+                                    "accuracy": result.accuracy,
+                                    "m_score": result.metrics_v2.get("m_score") if result.metrics_v2 else None,
+                                    "metrics_v2": result.metrics_v2,
+                                }, f, indent=2)
 
     run_id = str(uuid.uuid4())[:8]
     config_hash = hashlib.sha256(json.dumps({

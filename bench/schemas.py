@@ -36,6 +36,8 @@ class RunRecord:
     citation_recall: float
     latency_retrieve_s: float
     latency_llm_s: float
+    prompt_text: Optional[str] = None  # for traces
+    memory_updates: Optional[list[dict]] = None  # [{id, text_snippet}] for traces
 
 
 @dataclass

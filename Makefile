@@ -1,4 +1,4 @@
-.PHONY: venv install test run_ui run_api run_suite
+.PHONY: venv install test lint run_ui run_api run_suite
 
 # Create .venv and install deps (Python 3.11+)
 venv:
@@ -9,8 +9,11 @@ venv:
 install:
 	pip install -r requirements.txt
 
+lint:
+	ruff check .
+
 test:
-	cd "$(CURDIR)" && PYTHONPATH=. python -m pytest tests/ -v
+	cd "$(CURDIR)" && PYTHONPATH=. python -m pytest tests/ -v --tb=short
 
 run_ui:
 	PYTHONPATH=. streamlit run app/ui/streamlit_app.py --server.port 8501

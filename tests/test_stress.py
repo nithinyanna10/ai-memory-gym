@@ -31,9 +31,9 @@ def test_contradiction_injection():
 
 def test_distribution_shift():
     scenario = Scenario(name="t", steps=[ScenarioStep(1, 1, "Formal text"), ScenarioStep(2, 2, "More")], ground_truth=[])
-    out = distribution_shift(scenario, style_switch_day=2)
-    assert "[casual]" in out.steps[1].event_text
-    assert "[casual]" not in out.steps[0].event_text
+    out = distribution_shift(scenario, style_switch_day=2, seed=42)
+    assert "[slack]" in out.steps[1].event_text
+    assert "[slack]" not in out.steps[0].event_text
 
 
 def test_memory_corruption_episodic():

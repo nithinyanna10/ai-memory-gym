@@ -40,3 +40,10 @@ def test_suite_runner_produces_files():
             manifest = json.load(f)
         assert manifest["suite_run_id"] == result.run_id
         assert "n_runs" in manifest
+        run_id0 = result.results[0].run_id
+        run_dir = Path(tmp) / "runs" / run_id0
+        assert run_dir.exists()
+        assert (run_dir / "manifest.json").exists()
+        assert (run_dir / "traces.jsonl").exists()
+        assert (run_dir / "metrics.json").exists()
+        assert (run_dir / "summary.csv").exists()

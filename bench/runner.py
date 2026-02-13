@@ -52,6 +52,8 @@ def run_benchmark(config: BenchmarkConfig) -> BenchmarkResult:
             citation_precision=citation_precision(out.citations, gold_ids),
             citation_recall=citation_recall(out.citations, gold_ids),
             latency_retrieve_s=out.latency_retrieve_s, latency_llm_s=out.latency_llm_s,
+            prompt_text=getattr(out, "prompt_text", None),
+            memory_updates=getattr(out, "memory_updates", None),
         ))
 
     metrics = compute_metrics(records)
@@ -88,6 +90,12 @@ def run_benchmark(config: BenchmarkConfig) -> BenchmarkResult:
 def save_result(result: BenchmarkResult, out_dir: str = "data/runs") -> str:
     Path(out_dir).mkdir(parents=True, exist_ok=True)
     path = os.path.join(out_dir, f"run_{result.run_id}.json")
+    run_dir = os.path.join(out_dir, "runs", result.run_id or "unknown")
+    try:
+        from bench.artifacts import write_run_artifacts
+        write_run_artifacts(result, run_dir, cached=False)
+    except Exception:
+        pass
     data = {
         "run_id": result.run_id,
         "config": {
@@ -101,6 +109,9 @@ def save_result(result: BenchmarkResult, out_dir: str = "data/runs") -> str:
             "salience_threshold": result.config.salience_threshold,
             "rehearsal_frequency": result.config.rehearsal_frequency,
             "use_mock_llm": result.config.use_mock_llm,
+            "llm_mode": getattr(result.config, "llm_mode", "mock"),
+            "stress_mode": getattr(result.config, "stress_mode", None),
+            "stress_kwargs": getattr(result.config, "stress_kwargs", {}),
         },
         "accuracy": result.accuracy,
         "citation_precision": result.citation_precision,
@@ -114,7 +125,8 @@ def save_result(result: BenchmarkResult, out_dir: str = "data/runs") -> str:
             {"day": r.day, "turn": r.turn, "question": r.question, "gold_answer": r.gold_answer,
              "answer": r.answer, "citations": r.citations, "gold_fact_ids": r.gold_fact_ids,
              "retrieved": r.retrieved, "correct": r.correct, "citation_precision": r.citation_precision, "citation_recall": r.citation_recall,
-             "latency_retrieve_s": r.latency_retrieve_s, "latency_llm_s": r.latency_llm_s}
+             "latency_retrieve_s": r.latency_retrieve_s, "latency_llm_s": r.latency_llm_s,
+             "prompt_text": getattr(r, "prompt_text", None), "memory_updates": getattr(r, "memory_updates", None)}
             for r in result.run_records
         ],
         "metrics_v2": result.metrics_v2,
@@ -129,17 +141,21 @@ def load_result(path: str) -> BenchmarkResult:
     import json
     with open(path) as f:
         data = json.load(f)
+    c = data["config"]
     config = BenchmarkConfig(
-        scenario_type=data["config"]["scenario_type"],
-        policy=data["config"]["policy"],
-        seed=data["config"].get("seed"),
-        number_of_days=data["config"].get("number_of_days", 7),
-        wm_size=data["config"].get("wm_size", 10),
-        top_k=data["config"].get("top_k", 5),
-        decay_lambda=data["config"].get("decay_lambda", 0.1),
-        salience_threshold=data["config"].get("salience_threshold", 0.3),
-        rehearsal_frequency=data["config"].get("rehearsal_frequency", 3),
-        use_mock_llm=data["config"].get("use_mock_llm", True),
+        scenario_type=c["scenario_type"],
+        policy=c["policy"],
+        seed=c.get("seed"),
+        number_of_days=c.get("number_of_days", 7),
+        wm_size=c.get("wm_size", 10),
+        top_k=c.get("top_k", 5),
+        decay_lambda=c.get("decay_lambda", 0.1),
+        salience_threshold=c.get("salience_threshold", 0.3),
+        rehearsal_frequency=c.get("rehearsal_frequency", 3),
+        use_mock_llm=c.get("use_mock_llm", True),
+        llm_mode=c.get("llm_mode", "mock"),
+        stress_mode=c.get("stress_mode"),
+        stress_kwargs=c.get("stress_kwargs", {}),
     )
     records = []
     for r in data.get("run_records", []):
@@ -154,6 +170,7 @@ def load_result(path: str) -> BenchmarkResult:
             retrieved=retrieved,
             correct=r.get("correct", False), citation_precision=r.get("citation_precision", 0), citation_recall=r.get("citation_recall", 0),
             latency_retrieve_s=r.get("latency_retrieve_s", 0), latency_llm_s=r.get("latency_llm_s", 0),
+            prompt_text=r.get("prompt_text"), memory_updates=r.get("memory_updates"),
         ))
     return BenchmarkResult(
         config=config,

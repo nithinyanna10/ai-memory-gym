@@ -1,5 +1,7 @@
 """AI Memory Gym V2 — Cognitive Lab: production-grade evaluation UI."""
 
+import io
+import json
 import sys
 from pathlib import Path
 
@@ -15,8 +17,9 @@ matplotlib.use("Agg")
 import matplotlib.pyplot as plt
 
 from bench.schemas import BenchmarkConfig, SuiteRunConfig
-from bench.runner import run_benchmark, save_result, result_to_dataframe
+from bench.runner import run_benchmark, save_result, result_to_dataframe, load_result
 from bench.suite_runner import run_suite, load_suite_results
+from app.ui.run_loader import list_run_ids_from_disk, load_result_from_disk, leaderboard_rows_from_disk
 
 st.set_page_config(page_title="AI Memory Gym V2", layout="wide", initial_sidebar_state="expanded")
 
@@ -39,6 +42,10 @@ if "presets" not in st.session_state:
     st.session_state.presets = {}
 if "suite_progress" not in st.session_state:
     st.session_state.suite_progress = {"current": 0, "total": 0, "log": []}
+if "baseline_run_id" not in st.session_state:
+    st.session_state.baseline_run_id = None
+if "loaded_disk_results" not in st.session_state:
+    st.session_state.loaded_disk_results = {}
 
 DATA_DIR = ROOT / "data" / "runs"
 DATA_DIR.mkdir(parents=True, exist_ok=True)
@@ -56,10 +63,22 @@ with st.sidebar:
     st.header("Experiment Builder")
 
     st.subheader("Scenario Pack")
-    scenario_type = st.selectbox("Scenario", SCENARIO_OPTIONS, index=0, key="sb_scenario")
+    scenario_type = st.selectbox(
+        "Scenario",
+        SCENARIO_OPTIONS,
+        index=0,
+        key="sb_scenario",
+        help="Scenario pack: events + evaluation questions over days. E.g. personal_assistant = preferences + distractors; ops = procedures + incidents.",
+    )
 
     st.subheader("Policy")
-    policy = st.selectbox("Policy", POLICY_OPTIONS, index=1, key="sb_policy")
+    policy = st.selectbox(
+        "Policy",
+        POLICY_OPTIONS,
+        index=1,
+        key="sb_policy",
+        help="Memory policy: full_log stores all; vector_rag uses embeddings; rehearsal reinforces key items.",
+    )
 
     st.subheader("Stress")
     stress_mode = st.selectbox(
@@ -67,6 +86,7 @@ with st.sidebar:
         [None, "distraction_flood", "contradiction_injection", "distribution_shift", "memory_corruption"],
         format_func=lambda x: x or "None",
         key="sb_stress",
+        help="Optional stress: distraction_flood adds noise; contradiction_injection injects false fact; memory_corruption drops/mutates items.",
     )
     stress_kwargs = {}
     if stress_mode == "distraction_flood":
@@ -83,19 +103,20 @@ with st.sidebar:
         stress_kwargs["p_mutate"] = st.slider("p_mutate", 0.0, 0.5, 0.1, 0.05, key="sb_p_mutate")
         stress_kwargs["mutate_strength"] = st.slider("mutate_strength", 0.0, 1.0, 1.0, 0.1, key="sb_mutate_strength")
 
-    st.subheader("Advanced")
-    seed = st.number_input("Seed", value=42, min_value=0, step=1, key="sb_seed")
-    number_of_days = st.number_input("Days", value=7, min_value=1, max_value=30, step=1, key="sb_days")
-    wm_size = st.number_input("WM size", value=10, min_value=1, max_value=50, step=1, key="sb_wm")
-    top_k = st.number_input("Top K", value=5, min_value=1, max_value=20, step=1, key="sb_topk")
-    llm_mode = st.radio("LLM", ["mock", "rule", "real"], index=0, horizontal=True, key="sb_llm")
+    with st.expander("Advanced", expanded=False):
+        seed = st.number_input("Seed", value=42, min_value=0, step=1, key="sb_seed", help="Reproducibility seed.")
+        number_of_days = st.number_input("Days", value=7, min_value=1, max_value=30, step=1, key="sb_days")
+        wm_size = st.number_input("WM size", value=10, min_value=1, max_value=50, step=1, key="sb_wm")
+        top_k = st.number_input("Top K", value=5, min_value=1, max_value=20, step=1, key="sb_topk")
+        llm_mode = st.radio("LLM", ["mock", "rule", "real"], index=0, horizontal=True, key="sb_llm", help="mock=no API; rule=deterministic errors; real=OpenAI-compatible.")
 
     st.subheader("Save / Load preset")
-    preset_name = st.text_input("Preset name", value="", key="preset_name")
+    preset_name = st.text_input("Preset name", value="", key="preset_name", placeholder="e.g. default")
     col_save, col_load = st.columns(2)
     with col_save:
         if st.button("Save preset"):
-            st.session_state.presets[preset_name or "default"] = {
+            name = preset_name.strip() or "default"
+            st.session_state.presets[name] = {
                 "scenario_type": scenario_type, "policy": policy, "stress_mode": stress_mode,
                 "stress_kwargs": stress_kwargs, "seed": seed, "number_of_days": number_of_days,
                 "wm_size": wm_size, "top_k": top_k, "llm_mode": llm_mode,
@@ -114,6 +135,27 @@ with st.sidebar:
             st.session_state.sb_topk = p.get("top_k", 5)
             st.session_state.sb_llm = p.get("llm_mode", "mock")
             st.rerun()
+    # Preset export: download JSON
+    if st.session_state.presets:
+        preset_json = json.dumps(st.session_state.presets, indent=2)
+        st.download_button("Export presets (JSON)", preset_json, file_name="memory_gym_presets.json", mime="application/json", key="export_presets")
+    # Preset import: upload JSON
+    uploaded = st.file_uploader("Import presets", type=["json"], key="import_presets")
+    if uploaded is not None:
+        try:
+            data = json.load(uploaded)
+            if isinstance(data, dict):
+                st.session_state.presets.update(data)
+                st.success("Presets imported.")
+                st.rerun()
+        except Exception as e:
+            st.error(f"Invalid JSON: {e}")
+
+    st.subheader("Suite config (for Run suite)")
+    suite_policies = st.multiselect("Policies", POLICY_OPTIONS, default=["full_log", "vector_rag"], key="suite_policies", help="Policies to run in suite.")
+    suite_scenarios = st.multiselect("Scenarios", SCENARIO_OPTIONS, default=SCENARIO_OPTIONS[:4], key="suite_scenarios")
+    suite_seeds_raw = st.text_input("Seeds (comma-separated)", value="42, 43", key="suite_seeds", help="e.g. 42, 43, 44")
+    suite_stress_modes = st.multiselect("Stress modes", [None, "distraction_flood", "contradiction_injection"], default=[None], format_func=lambda x: x or "None", key="suite_stress")
 
 
 def build_config():
@@ -147,6 +189,8 @@ with header_col3:
     st.markdown(f'<span class="status-pill {status}">{status}</span>', unsafe_allow_html=True)
     if result and result.run_id:
         st.code(result.run_id, language=None)
+        summary = f"{result.config.scenario_type} · {result.config.policy} · {result.accuracy:.0%} · {result.token_estimate} tokens"
+        st.caption(summary)
     if result and st.session_state.last_run_cached:
         st.caption("(cached)")
 
@@ -164,15 +208,25 @@ if run_single_clicked:
 
 if run_suite_clicked:
     st.session_state.last_run_cached = False
-    policies = ["full_log", "vector_rag", "rolling_summary"][:2]
-    scenarios = SCENARIO_OPTIONS[:4]
-    seeds = [42, 43][:2]
+    policies = st.session_state.get("suite_policies", ["full_log", "vector_rag"])
+    scenarios = st.session_state.get("suite_scenarios", SCENARIO_OPTIONS[:4])
+    try:
+        seeds = [int(x.strip()) for x in st.session_state.get("suite_seeds", "42, 43").split(",") if x.strip()]
+    except ValueError:
+        seeds = [42, 43]
+    stress_modes = st.session_state.get("suite_stress", [None])
+    if not policies:
+        policies = ["full_log"]
+    if not scenarios:
+        scenarios = SCENARIO_OPTIONS[:2]
+    if not seeds:
+        seeds = [42]
     suite_config = SuiteRunConfig(
         policies=policies,
         scenarios=scenarios,
         seeds=seeds,
         number_of_days=min(5, number_of_days),
-        stress_modes=[None],
+        stress_modes=stress_modes,
         llm_mode=llm_mode,
         wm_size=wm_size,
         top_k=top_k,
@@ -198,15 +252,31 @@ result = st.session_state.current_result
 if view == "Dashboard":
     if result:
         mv2 = getattr(result, "metrics_v2", None) or {}
+        all_results_for_baseline = list(st.session_state.results)
+        for sr in st.session_state.suite_results:
+            all_results_for_baseline.extend(sr.results)
+        baseline_result = None
+        if all_results_for_baseline:
+            run_ids_for_baseline = [r.run_id for r in all_results_for_baseline if r.run_id]
+            default_baseline = st.session_state.baseline_run_id or (run_ids_for_baseline[0] if run_ids_for_baseline else None)
+            opts = ["(none)"] + run_ids_for_baseline
+            idx = opts.index(default_baseline) if default_baseline and default_baseline in opts else 0
+            baseline_sel = st.selectbox("Baseline for deltas", opts, index=min(idx, len(opts) - 1), key="baseline_sel")
+            if baseline_sel != "(none)":
+                st.session_state.baseline_run_id = baseline_sel
+                baseline_result = next((r for r in all_results_for_baseline if r.run_id == baseline_sel), None)
+
         st.subheader("Metric cards")
         q1, q2, q3, q4 = st.columns(4)
         with q1:
-            st.metric("Accuracy (Quality)", f"{result.accuracy:.2%}", delta=None)
+            delta_acc = (result.accuracy - baseline_result.accuracy) if baseline_result else None
+            st.metric("Accuracy (Quality)", f"{result.accuracy:.2%}", delta=f"{delta_acc:+.1%}" if delta_acc is not None else None)
         with q2:
             half_life = mv2.get("retention_half_life")
             st.metric("Retention half-life (Reliability)", str(half_life) if half_life is not None else "N/A", delta=None)
         with q3:
-            st.metric("Token estimate (Cost)", result.token_estimate, delta=None)
+            delta_tok = (result.token_estimate - baseline_result.token_estimate) if baseline_result else None
+            st.metric("Token estimate (Cost)", result.token_estimate, delta=delta_tok if delta_tok is not None else None)
         with q4:
             pii = mv2.get("pii_leakage_rate", 0)
             st.metric("PII leakage (Safety)", f"{pii:.2%}", delta=None)
@@ -231,7 +301,11 @@ if view == "Dashboard":
             ax.legend()
             ax.set_title("Accuracy vs Token Cost")
             st.pyplot(fig)
+            buf = io.BytesIO()
+            fig.savefig(buf, format="png", dpi=100, bbox_inches="tight")
             plt.close()
+            buf.seek(0)
+            st.download_button("Download Pareto (PNG)", buf, file_name="pareto_accuracy_vs_tokens.png", mime="image/png", key="dl_pareto")
 
         st.subheader("Forgetting curve")
         if result.forgetting_curve:
@@ -250,8 +324,12 @@ if view == "Dashboard":
             ax.set_ylabel("Accuracy")
             ax.set_ylim(0, 1.05)
             ax.legend()
+            buf2 = io.BytesIO()
+            fig.savefig(buf2, format="png", dpi=100, bbox_inches="tight")
+            buf2.seek(0)
             st.pyplot(fig)
             plt.close()
+            st.download_button("Download Forgetting curve (PNG)", buf2, file_name="forgetting_curve.png", mime="image/png", key="dl_forgetting")
 
         st.subheader("Error taxonomy & top failures")
         wrong = [r for r in result.run_records if not r.correct and r.question]
@@ -285,7 +363,15 @@ if view == "Leaderboard":
                     rows.append({"run_id": row.get("run_id"), "scenario": row.get("scenario"), "policy": row.get("policy"), "stress": row.get("stress_mode", "-"), "seed": row.get("seed"), "accuracy": row.get("accuracy"), "m_score": row.get("m_score"), "tokens": row.get("token_estimate")})
             except Exception:
                 pass
+    disk_rows = leaderboard_rows_from_disk(str(DATA_DIR))
+    seen = {r["run_id"] for r in rows}
+    for dr in disk_rows:
+        if dr.get("run_id") and dr["run_id"] not in seen:
+            rows.append(dr)
+            seen.add(dr["run_id"])
     if rows:
+        if st.button("Refresh from disk", key="lead_refresh"):
+            st.rerun()
         df_lead = pd.DataFrame(rows)
         sc_filter = st.selectbox("Filter scenario", ["All"] + list(df_lead["scenario"].dropna().unique().tolist()), key="lead_sc")
         if sc_filter != "All":
@@ -340,11 +426,22 @@ if view == "Stress Lab":
 
 # ---------- Traces ----------
 if view == "Traces":
-    run_options = [r.run_id for r in st.session_state.results if r.run_id]
+    run_options_session = [r.run_id for r in st.session_state.results if r.run_id]
+    disk_runs = [(rid, path) for rid, path in list_run_ids_from_disk(str(DATA_DIR)) if path]
+    run_options = list(dict.fromkeys(run_options_session + [r[0] for r in disk_runs]))
     if run_options:
-        run_id_sel = st.selectbox("Run", run_options, key="trace_run")
+        run_id_sel = st.selectbox("Run", run_options, key="trace_run", help="Includes runs from this session and from data/runs on disk.")
         res = next((r for r in st.session_state.results if r.run_id == run_id_sel), None)
-        if res and res.run_records:
+        if res is None and run_id_sel in st.session_state.loaded_disk_results:
+            res = st.session_state.loaded_disk_results[run_id_sel]
+        if res is None and run_id_sel not in run_options_session:
+            with st.spinner("Loading run from disk..."):
+                res = load_result_from_disk(str(DATA_DIR), run_id_sel)
+            if res is not None:
+                st.session_state.loaded_disk_results[run_id_sel] = res
+        if res is None:
+            st.warning("Could not load run. Ensure data/runs/run_<id>.json exists.")
+        elif res and res.run_records:
             step_i = st.slider("Step", 0, len(res.run_records) - 1, 0, key="trace_step")
             rec = res.run_records[step_i]
             c1, c2 = st.columns(2)
@@ -369,16 +466,30 @@ if view == "Traces":
             if rec.retrieved:
                 best = max(rec.retrieved, key=lambda x: x[2])
                 st.caption(f"Highest influence (heuristic): {best[0]} — {best[1]} ({best[2]:.3f})")
+        elif res and not res.run_records:
+            st.info("This run has no step records.")
     else:
-        st.markdown('<div class="empty-state"><strong>No traces</strong><br/>Run a benchmark to view step-by-step traces.</div>', unsafe_allow_html=True)
+        st.markdown('<div class="empty-state"><strong>No traces</strong><br/>Run a benchmark or select a run from disk to view step-by-step traces.</div>', unsafe_allow_html=True)
 
 # ---------- Memory MRI ----------
 if view == "Memory MRI":
-    run_options = [r.run_id for r in st.session_state.results if r.run_id]
-    if run_options:
-        run_id_mri = st.selectbox("Run for MRI", run_options, key="mri_run")
+    run_options_mri = [r.run_id for r in st.session_state.results if r.run_id]
+    for rid, path in list_run_ids_from_disk(str(DATA_DIR)):
+        if path and rid not in run_options_mri:
+            run_options_mri.append(rid)
+    if run_options_mri:
+        run_id_mri = st.selectbox("Run for MRI", run_options_mri, key="mri_run", help="Includes runs from session and disk.")
         res = next((r for r in st.session_state.results if r.run_id == run_id_mri), None)
-        if res and res.run_records:
+        if res is None and run_id_mri in st.session_state.loaded_disk_results:
+            res = st.session_state.loaded_disk_results[run_id_mri]
+        if res is None:
+            with st.spinner("Loading run from disk..."):
+                res = load_result_from_disk(str(DATA_DIR), run_id_mri)
+            if res is not None:
+                st.session_state.loaded_disk_results[run_id_mri] = res
+        if res is None:
+            st.warning("Could not load run from disk. Ensure run_<id>.json exists in data/runs.")
+        elif res and res.run_records:
             texts, days, types_list = [], [], []
             for r in res.run_records:
                 for mid, reason, score in r.retrieved:

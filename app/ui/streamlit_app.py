@@ -19,7 +19,40 @@ import matplotlib.pyplot as plt
 from bench.schemas import BenchmarkConfig, SuiteRunConfig
 from bench.runner import run_benchmark, save_result, result_to_dataframe, load_result
 from bench.suite_runner import run_suite, load_suite_results
+from bench.experiment_config import stable_config_hash
 from app.ui.run_loader import list_run_ids_from_disk, load_result_from_disk, leaderboard_rows_from_disk
+
+
+def _all_run_ids_and_results():
+    """Return (list of run_ids, dict run_id -> result for session). Disk runs loaded on demand."""
+    run_ids = []
+    result_map = {}
+    for r in st.session_state.results:
+        if r.run_id:
+            run_ids.append(r.run_id)
+            result_map[r.run_id] = r
+    for sr in st.session_state.suite_results:
+        for r in sr.results:
+            if r.run_id and r.run_id not in result_map:
+                run_ids.append(r.run_id)
+                result_map[r.run_id] = r
+    for rid, path in list_run_ids_from_disk(str(DATA_DIR)):
+        if path and rid not in result_map:
+            run_ids.append(rid)
+    return run_ids, result_map
+
+
+def _get_result(run_id: str):
+    """Resolve run_id to BenchmarkResult (session or disk cache)."""
+    _, result_map = _all_run_ids_and_results()
+    if run_id in result_map:
+        return result_map[run_id]
+    if run_id in st.session_state.loaded_disk_results:
+        return st.session_state.loaded_disk_results[run_id]
+    res = load_result_from_disk(str(DATA_DIR), run_id)
+    if res:
+        st.session_state.loaded_disk_results[run_id] = res
+    return res
 
 st.set_page_config(page_title="AI Memory Gym V2", layout="wide", initial_sidebar_state="expanded")
 
@@ -157,6 +190,31 @@ with st.sidebar:
     suite_seeds_raw = st.text_input("Seeds (comma-separated)", value="42, 43", key="suite_seeds", help="e.g. 42, 43, 44")
     suite_stress_modes = st.multiselect("Stress modes", [None, "distraction_flood", "contradiction_injection"], default=[None], format_func=lambda x: x or "None", key="suite_stress")
 
+    st.subheader("Quick presets")
+    q1, q2 = st.columns(2)
+    with q1:
+        if st.button("Default", key="qp_default"):
+            st.session_state.sb_scenario = "personal_assistant"
+            st.session_state.sb_policy = "full_log"
+            st.session_state.sb_stress = None
+            st.session_state.sb_seed = 42
+            st.session_state.sb_days = 7
+            st.session_state.sb_llm = "mock"
+            st.rerun()
+    with q2:
+        if st.button("Stress test", key="qp_stress"):
+            st.session_state.sb_scenario = "adversarial_injection"
+            st.session_state.sb_policy = "full_log"
+            st.session_state.sb_stress = "contradiction_injection"
+            st.session_state.sb_seed = 42
+            st.session_state.sb_days = 7
+            st.session_state.sb_llm = "rule"
+            st.rerun()
+
+    config_for_hash = {"scenario_type": scenario_type, "policy": policy, "seed": seed, "number_of_days": number_of_days, "wm_size": wm_size, "top_k": top_k, "llm_mode": llm_mode, "stress_mode": stress_mode, "stress_kwargs": stress_kwargs}
+    config_hash = stable_config_hash(config_for_hash)
+    st.caption(f"Config hash: `{config_hash}`")
+
 
 def build_config():
     return BenchmarkConfig(
@@ -241,7 +299,7 @@ if run_suite_clicked:
 # ---------- Main: view selector ----------
 view = st.radio(
     "View",
-    ["Dashboard", "Leaderboard", "Stress Lab", "Traces", "Memory MRI", "Reports", "Legacy"],
+    ["Dashboard", "Compare", "Leaderboard", "Stress Lab", "Traces", "Memory MRI", "Reports", "Legacy"],
     horizontal=True,
     key="main_view",
 )
@@ -344,7 +402,61 @@ if view == "Dashboard":
             st.info("No incorrect answers in this run.")
     else:
         st.markdown('<div class="empty-state"><strong>Run experiment</strong><br/>Use the sidebar to configure and click "Run single" or "Run suite".</div>', unsafe_allow_html=True)
-        st.caption("Example: Scenario = personal_assistant, Policy = full_log, Seed = 42.")
+        c1, c2 = st.columns(2)
+        with c1:
+            if st.button("Try: personal_assistant + full_log", key="empty_try1"):
+                st.session_state.sb_scenario = "personal_assistant"
+                st.session_state.sb_policy = "full_log"
+                st.rerun()
+        with c2:
+            if st.button("Try: ops + vector_rag", key="empty_try2"):
+                st.session_state.sb_scenario = "ops"
+                st.session_state.sb_policy = "vector_rag"
+                st.rerun()
+
+# ---------- Compare ----------
+if view == "Compare":
+    run_ids_list, _ = _all_run_ids_and_results()
+    if len(run_ids_list) >= 2:
+        compare_selected = st.multiselect("Select 2 or 3 runs to compare", run_ids_list, default=run_ids_list[:2] if len(run_ids_list) >= 2 else [], max_selections=3, key="compare_sel")
+        if len(compare_selected) >= 2:
+            results_to_compare = []
+            for rid in compare_selected:
+                r = _get_result(rid)
+                if r:
+                    results_to_compare.append(r)
+            if len(results_to_compare) >= 2:
+                st.subheader("Side-by-side")
+                n = len(results_to_compare)
+                cols = st.columns(n)
+                for i, r in enumerate(results_to_compare):
+                    with cols[i]:
+                        st.caption(f"**{r.run_id}**")
+                        st.metric("Accuracy", f"{r.accuracy:.2%}")
+                        st.metric("Tokens", r.token_estimate)
+                        mv2 = getattr(r, "metrics_v2", None) or {}
+                        st.metric("M-Score", f"{mv2.get('m_score', 0):.3f}" if mv2.get("m_score") is not None else "—")
+                        st.write(f"Scenario: {r.config.scenario_type} · Policy: {r.config.policy}")
+                st.subheader("Forgetting curve overlay")
+                fig, ax = plt.subplots()
+                colors_ = ["#1f77b4", "#ff7f0e", "#2ca02c"]
+                for i, r in enumerate(results_to_compare):
+                    if r.forgetting_curve:
+                        days = [x[0] for x in r.forgetting_curve]
+                        accs = [x[1] for x in r.forgetting_curve]
+                        ax.plot(days, accs, marker="o", label=f"{r.run_id} ({r.config.policy})", color=colors_[i % len(colors_)])
+                ax.set_xlabel("Day")
+                ax.set_ylabel("Accuracy")
+                ax.set_ylim(0, 1.05)
+                ax.legend()
+                st.pyplot(fig)
+                plt.close()
+            else:
+                st.warning("Could not load one or more runs.")
+        else:
+            st.info("Select at least 2 runs.")
+    else:
+        st.markdown('<div class="empty-state"><strong>Need 2+ runs to compare</strong><br/>Run single or suite first.</div>', unsafe_allow_html=True)
 
 # ---------- Leaderboard ----------
 if view == "Leaderboard":
@@ -381,6 +493,10 @@ if view == "Leaderboard":
             df_lead = df_lead[df_lead["stress"] == stress_filter]
         sort_col = "m_score" if "m_score" in df_lead.columns and df_lead["m_score"].notna().any() else "accuracy"
         df_lead = df_lead.sort_values(sort_col, ascending=False)
+        current_run_id = (st.session_state.current_result.run_id if st.session_state.current_result else None)
+        if current_run_id and "run_id" in df_lead.columns:
+            df_lead = df_lead.copy()
+            df_lead["current"] = df_lead["run_id"].apply(lambda x: "★" if x == current_run_id else "")
         st.dataframe(df_lead, use_container_width=True)
         if "m_score" in df_lead.columns and df_lead["m_score"].notna().any() and len(df_lead) > 1:
             fig, ax = plt.subplots()
@@ -409,18 +525,32 @@ if view == "Stress Lab":
     for sr in st.session_state.suite_results:
         for r in sr.results:
             rows_heat.append({"policy": r.config.policy, "scenario": r.config.scenario_type, "accuracy": r.accuracy, "stress": getattr(r.config, "stress_mode", None) or "none"})
+    for r in st.session_state.results:
+        rows_heat.append({"policy": r.config.policy, "scenario": r.config.scenario_type, "accuracy": r.accuracy, "stress": getattr(r.config, "stress_mode", None) or "none"})
     if rows_heat:
         df_h = pd.DataFrame(rows_heat)
-        pivot = df_h.pivot_table(index="policy", columns="scenario", values="accuracy", aggfunc="mean")
-        fig, ax = plt.subplots()
-        im = ax.imshow(pivot.fillna(0).values, aspect="auto", vmin=0, vmax=1)
-        ax.set_xticks(range(len(pivot.columns)))
-        ax.set_xticklabels(pivot.columns, rotation=45, ha="right")
-        ax.set_yticks(range(len(pivot.index)))
-        ax.set_yticklabels(pivot.index)
-        plt.colorbar(im, ax=ax, label="Accuracy")
-        st.pyplot(fig)
-        plt.close()
+        stress_filter_heat = st.selectbox("Filter by stress", ["All"] + list(df_h["stress"].dropna().unique().astype(str).tolist()), key="stress_heat_filter")
+        if stress_filter_heat != "All":
+            df_h = df_h[df_h["stress"].astype(str) == stress_filter_heat]
+        if not df_h.empty:
+            pivot = df_h.pivot_table(index="policy", columns="scenario", values="accuracy", aggfunc="mean")
+            fig, ax = plt.subplots()
+            vals = pivot.fillna(0).values
+            im = ax.imshow(vals, aspect="auto", vmin=0, vmax=1, cmap="RdYlGn")
+            ax.set_xticks(range(len(pivot.columns)))
+            ax.set_xticklabels(pivot.columns, rotation=45, ha="right")
+            ax.set_yticks(range(len(pivot.index)))
+            ax.set_yticklabels(pivot.index)
+            for i in range(len(pivot.index)):
+                for j in range(len(pivot.columns)):
+                    v = pivot.iloc[i, j]
+                    vv = v if not pd.isna(v) else 0
+                    ax.text(j, i, f"{vv:.2f}", ha="center", va="center", color="black", fontsize=8)
+            plt.colorbar(im, ax=ax, label="Accuracy")
+            st.pyplot(fig)
+            plt.close()
+        else:
+            st.info("No data for selected stress filter.")
     else:
         st.info("Run benchmarks with and without stress to see comparison.")
 
@@ -444,28 +574,27 @@ if view == "Traces":
         elif res and res.run_records:
             step_i = st.slider("Step", 0, len(res.run_records) - 1, 0, key="trace_step")
             rec = res.run_records[step_i]
-            c1, c2 = st.columns(2)
-            with c1:
-                st.write("**Prompt**")
+            st.caption(f"Day {rec.day} · Turn {rec.turn}")
+            with st.expander("Prompt", expanded=True):
                 prompt_text = getattr(rec, "prompt_text", None)
-                st.text(prompt_text[:3000] if prompt_text else "(not recorded)")
-            with c2:
-                st.write("**Retrieved memories** (scores & reasons)")
+                text = (prompt_text or "(not recorded)")[:5000]
+                st.code(text, language="text")
+            with st.expander("Retrieved memories (scores & reasons)", expanded=True):
                 for mid, reason, score in rec.retrieved:
                     st.caption(f"`{mid}` — {reason}: {score:.3f}")
-            st.write("**Memory updates**")
-            updates = getattr(rec, "memory_updates", None) or []
-            for u in updates:
-                st.json(u)
-            st.write("**Answer**")
-            st.write(rec.answer)
-            st.write("**Gold**")
-            st.write(rec.gold_answer or "-")
-            st.write("**Correct**")
-            st.write(rec.correct)
+            with st.expander("Memory updates"):
+                updates = getattr(rec, "memory_updates", None) or []
+                for u in updates:
+                    st.json(u)
+                if not updates:
+                    st.caption("(none)")
+            with st.expander("Answer vs Gold", expanded=True):
+                st.code(rec.answer or "(empty)", language="text")
+                st.write("**Gold:**", rec.gold_answer or "-")
+                st.write("**Correct:**", rec.correct)
             if rec.retrieved:
                 best = max(rec.retrieved, key=lambda x: x[2])
-                st.caption(f"Highest influence (heuristic): {best[0]} — {best[1]} ({best[2]:.3f})")
+                st.info(f"Highest influence (heuristic): **{best[0]}** — {best[1]} ({best[2]:.3f})")
         elif res and not res.run_records:
             st.info("This run has no step records.")
     else:
@@ -490,17 +619,19 @@ if view == "Memory MRI":
         if res is None:
             st.warning("Could not load run from disk. Ensure run_<id>.json exists in data/runs.")
         elif res and res.run_records:
-            texts, days, types_list = [], [], []
-            for r in res.run_records:
+            texts, days, types_list, step_used_in = [], [], [], []
+            for step_idx, r in enumerate(res.run_records):
                 for mid, reason, score in r.retrieved:
                     texts.append(f"{mid} {reason}")
                     types_list.append("retrieved")
                     days.append(r.day)
+                    step_used_in.append([step_idx])
                 for u in (getattr(r, "memory_updates", None) or []):
                     snip = u.get("text_snippet", u.get("id", ""))
                     texts.append(snip[:200])
                     types_list.append("update")
                     days.append(r.day)
+                    step_used_in.append([step_idx])
             if len(texts) >= 2:
                 from numpy.linalg import svd
                 vocab = {}
@@ -516,16 +647,25 @@ if view == "Memory MRI":
                 U, S, Vt = svd(X, full_matrices=False)
                 coords = U[:, :2] * S[:2]
                 fig, ax = plt.subplots()
-                scatter = ax.scatter(coords[:, 0], coords[:, 1], c=days, cmap="viridis", s=50, alpha=0.8)
-                for i, (x, y) in enumerate(coords):
-                    ax.annotate(str(days[i]), (x, y), fontsize=6)
-                plt.colorbar(scatter, ax=ax, label="Day")
-                ax.set_title("Memory projection (PCA-style)")
+                dmin, dmax = min(days), max(days) or 1
+                retrieved_idx = [i for i in range(len(types_list)) if types_list[i] == "retrieved"]
+                update_idx = [i for i in range(len(types_list)) if types_list[i] == "update"]
+                if retrieved_idx:
+                    sc1 = ax.scatter(coords[retrieved_idx, 0], coords[retrieved_idx, 1], c=[days[i] for i in retrieved_idx], cmap="viridis", s=60, alpha=0.8, marker="o", label="retrieved", vmin=dmin, vmax=dmax)
+                if update_idx:
+                    ax.scatter(coords[update_idx, 0], coords[update_idx, 1], c=[days[i] for i in update_idx], cmap="viridis", s=60, alpha=0.8, marker="s", label="update", vmin=dmin, vmax=dmax)
+                if retrieved_idx:
+                    plt.colorbar(sc1, ax=ax, label="Day")
+                ax.legend()
+                ax.set_title("Memory projection (PCA) · ○ retrieved, □ update")
                 st.pyplot(fig)
                 plt.close()
-                sel_idx = st.selectbox("Select point (by index)", range(len(texts)), format_func=lambda i: f"{i}: day={days[i]} {texts[i][:50]}...", key="mri_sel")
+                sel_idx = st.selectbox("Select point (by index)", range(len(texts)), format_func=lambda i: f"{i}: day={days[i]} [{types_list[i]}] {texts[i][:45]}...", key="mri_sel")
                 st.write("**Memory text:**", texts[sel_idx])
                 st.write("**Day:**", days[sel_idx], "**Type:**", types_list[sel_idx])
+                steps_used = step_used_in[sel_idx] if sel_idx < len(step_used_in) else []
+                if steps_used:
+                    st.write("**Used in steps (question index):**", ", ".join(str(s) for s in steps_used))
             else:
                 st.info("Need at least 2 memory items for projection.")
         else:
@@ -534,8 +674,29 @@ if view == "Memory MRI":
         st.markdown('<div class="empty-state"><strong>No runs</strong><br/>Run a benchmark to see Memory MRI.</div>', unsafe_allow_html=True)
 
 # ---------- Reports ----------
+def _recommendations(result):
+    recs = []
+    mv2 = getattr(result, "metrics_v2", None) or {}
+    if result.accuracy < 0.7:
+        recs.append("Accuracy below 70%: consider trying a different policy (e.g. vector_rag or rehearsal) or checking scenario difficulty.")
+    pii = mv2.get("pii_leakage_rate", 0)
+    if pii > 0:
+        recs.append("PII leakage detected: add filtering or redaction for sensitive content in memory and responses.")
+    contrad = mv2.get("contradiction_rate", 0)
+    if contrad > 0.1:
+        recs.append("Contradiction rate is elevated: enable verification or prioritise more recent facts.")
+    if result.token_estimate > 5000:
+        recs.append("High token usage: consider rolling_summary or salience_only to reduce cost.")
+    if not recs:
+        recs.append("Metrics look healthy. Try stress modes (Stress Lab) to test robustness.")
+    return recs
+
+
 if view == "Reports":
     if result:
+        st.write("**Recommendations** (from current run metrics)")
+        for rec in _recommendations(result):
+            st.markdown(f"- {rec}")
         if st.button("Generate PDF report"):
             try:
                 from reportlab.lib.pagesizes import letter
@@ -552,6 +713,10 @@ if view == "Reports":
                 mv2 = getattr(result, "metrics_v2", None)
                 if mv2:
                     story.append(Paragraph(f"M-Score: {mv2.get('m_score', 0):.3f}", styles["Normal"]))
+                story.append(Spacer(1, 12))
+                story.append(Paragraph("Recommendations", styles["Heading2"]))
+                for rec in _recommendations(result):
+                    story.append(Paragraph(f"• {rec}", styles["Normal"]))
                 story.append(Spacer(1, 20))
                 data = [["Metric", "Value"], ["Accuracy", f"{result.accuracy:.2%}"], ["Citation Precision", f"{result.citation_precision:.2%}"], ["Memory Items", str(result.memory_items_stored)]]
                 t = Table(data)

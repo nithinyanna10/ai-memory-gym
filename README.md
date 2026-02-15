@@ -139,7 +139,3 @@ ai-memory-gym/
 - **distribution_shift** — From style_switch_day onward, apply shift_style (slack/formal/noisy).
 
 All stress modes are deterministic given seed.
-
-## Reproducibility
-
-Same **config + seed** produces the same outputs. Config hashing uses sorted JSON; artifacts are written under `data/runs/runs/<run_id>/` (manifest.json, traces.jsonl, metrics.json, summary.csv, summary.parquet, run.log). Suite runs reuse cached results by config hash.

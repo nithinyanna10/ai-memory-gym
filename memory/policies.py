@@ -2,12 +2,13 @@
 
 from dataclasses import dataclass
 from typing import Optional
+
 from memory.base import MemoryItem, RetrievalResult
 from memory.working import WorkingMemory
 from memory.episodic import EpisodicMemory
 from memory.semantic import SemanticMemory
 from memory.procedural import ProceduralMemory
-from memory.embeddings import embed_text, TFIDFEmbedder
+from memory.embeddings import TFIDFEmbedder, embed_text
 from memory.consolidation import run_consolidation
 
 
@@ -97,6 +98,160 @@ def rehearsal(query: str, state: Optional[BrainState], ctx: PolicyContext) -> li
     return hybrid_brain(query, state, ctx)
 
 
+def semantic_first(query: str, state: Optional[BrainState], ctx: PolicyContext) -> list[RetrievalResult]:
+    """Hybrid policy that prioritizes distilled semantic facts, then episodic context, then working/procedural.
+
+    Useful for questions that ask for crisp facts or preferences where consolidation has already run.
+    """
+    if state is None:
+        return []
+    state.episodic.set_current_day(ctx.current_day)
+
+    query_emb = embed_text(query)
+    sem_results = state.semantic.retrieve(query, top_k=ctx.top_k)
+    ep_results = state.episodic.retrieve(
+        query,
+        top_k=ctx.top_k * 2,
+        query_embedding=query_emb,
+        day=ctx.current_day,
+    )
+    wm_results = state.working.retrieve(query, top_k=min(2, ctx.top_k))
+    proc_results = state.procedural.retrieve(query, top_k=min(2, ctx.top_k))
+
+    results: list[RetrievalResult] = []
+    for r in sem_results:
+        r.reason = "semantic_primary"
+        r.score *= 1.1
+        results.append(r)
+    for r in ep_results:
+        # keep original reason from EpisodicMemory, just nudge a bit lower than semantic
+        r.score *= 0.95
+        results.append(r)
+    for r in wm_results:
+        r.reason = "working_context"
+        r.score *= 0.9
+        results.append(r)
+    for r in proc_results:
+        r.reason = "procedural_support"
+        r.score *= 0.9
+        results.append(r)
+
+    results.sort(key=lambda x: -x.score)
+    return results[: ctx.top_k]
+
+
+def procedure_centric(query: str, state: Optional[BrainState], ctx: PolicyContext) -> list[RetrievalResult]:
+    """Policy that routes 'how-to' and procedure-style questions through ProceduralMemory first.
+
+    For non-procedural queries it falls back to hybrid_brain.
+    """
+    if state is None:
+        return []
+
+    q_lower = query.lower()
+    procedural_markers = (
+        "how do i",
+        "how to",
+        "step",
+        "steps",
+        "runbook",
+        "procedure",
+        "incident",
+        "playbook",
+        "checklist",
+    )
+    is_procedural = any(m in q_lower for m in procedural_markers)
+    if not is_procedural:
+        return hybrid_brain(query, state, ctx)
+
+    state.episodic.set_current_day(ctx.current_day)
+    query_emb = embed_text(query)
+
+    proc_results = state.procedural.retrieve(query, top_k=ctx.top_k)
+    ep_results = state.episodic.retrieve(
+        query,
+        top_k=ctx.top_k * 2,
+        query_embedding=query_emb,
+        day=ctx.current_day,
+    )
+    wm_results = state.working.retrieve(query, top_k=min(2, ctx.top_k))
+
+    results: list[RetrievalResult] = []
+    for r in proc_results:
+        r.reason = "procedural_primary"
+        r.score *= 1.2
+        results.append(r)
+    for r in ep_results:
+        r.reason = "episodic_support"
+        r.score *= 0.95
+        results.append(r)
+    for r in wm_results:
+        r.reason = "working_context"
+        r.score *= 0.9
+        results.append(r)
+
+    results.sort(key=lambda x: -x.score)
+    return results[: ctx.top_k]
+
+
+def long_term_focus(query: str, state: Optional[BrainState], ctx: PolicyContext) -> list[RetrievalResult]:
+    """Bias toward older episodic memories (long-horizon recall) while still allowing recent context.
+
+    This is useful for scenarios like research_long or legal_contract where the question
+    might refer back to information introduced many days earlier.
+    """
+    if state is None:
+        return []
+
+    state.episodic.set_current_day(ctx.current_day)
+    query_emb = embed_text(query)
+
+    ep_results = state.episodic.retrieve(
+        query,
+        top_k=ctx.top_k * 3,
+        query_embedding=query_emb,
+        day=ctx.current_day,
+    )
+    if not ep_results:
+        # Fallback to hybrid if nothing stored yet
+        return hybrid_brain(query, state, ctx)
+
+    # Prefer items at least 2 "days" old; if not enough, fill with the best of the rest.
+    long_horizon: list[RetrievalResult] = []
+    recent: list[RetrievalResult] = []
+    for r in ep_results:
+        age = ctx.current_day - r.item.timestamp
+        if age >= 2:
+            r.reason = "episodic_long_term"
+            long_horizon.append(r)
+        else:
+            r.reason = "episodic_recent"
+            recent.append(r)
+
+    long_horizon.sort(key=lambda x: -x.score)
+    recent.sort(key=lambda x: -x.score)
+
+    selected: list[RetrievalResult] = long_horizon[: ctx.top_k]
+    if len(selected) < ctx.top_k:
+        needed = ctx.top_k - len(selected)
+        selected.extend(recent[:needed])
+
+    # Provide a very small amount of working/semantic context for grounding.
+    wm_results = state.working.retrieve(query, top_k=1)
+    sem_results = state.semantic.retrieve(query, top_k=1)
+    for r in wm_results:
+        r.reason = "working_support"
+        r.score *= 0.8
+        selected.append(r)
+    for r in sem_results:
+        r.reason = "semantic_support"
+        r.score *= 0.9
+        selected.append(r)
+
+    selected.sort(key=lambda x: -x.score)
+    return selected[: ctx.top_k]
+
+
 POLICIES = {
     "no_memory": no_memory,
     "full_log": full_log,
@@ -105,6 +260,9 @@ POLICIES = {
     "hybrid_brain": hybrid_brain,
     "salience_only": salience_only,
     "rehearsal": rehearsal,
+    "semantic_first": semantic_first,
+    "procedure_centric": procedure_centric,
+    "long_term_focus": long_term_focus,
 }
 
 

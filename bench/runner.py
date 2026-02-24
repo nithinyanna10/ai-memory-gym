@@ -45,16 +45,25 @@ def run_benchmark(config: BenchmarkConfig) -> BenchmarkResult:
         out = runner.run_step(step_in)
         total_tokens += len(step.event_text.split()) * 2 + len(out.answer.split()) * 2
         gold_ids = step.gold_fact_ids or []
-        records.append(RunRecord(
-            day=step.day, turn=step.turn, question=step.question, gold_answer=step.gold_answer,
-            answer=out.answer, citations=out.citations, gold_fact_ids=gold_ids, retrieved=out.retrieved,
-            correct=answer_correct(step.gold_answer, out.answer),
-            citation_precision=citation_precision(out.citations, gold_ids),
-            citation_recall=citation_recall(out.citations, gold_ids),
-            latency_retrieve_s=out.latency_retrieve_s, latency_llm_s=out.latency_llm_s,
-            prompt_text=getattr(out, "prompt_text", None),
-            memory_updates=getattr(out, "memory_updates", None),
-        ))
+        records.append(
+            RunRecord(
+                day=step.day,
+                turn=step.turn,
+                question=step.question,
+                gold_answer=step.gold_answer,
+                answer=out.answer,
+                citations=out.citations,
+                gold_fact_ids=gold_ids,
+                retrieved=out.retrieved,
+                correct=answer_correct(step.gold_answer, out.answer),
+                citation_precision=citation_precision(out.citations, gold_ids),
+                citation_recall=citation_recall(out.citations, gold_ids),
+                latency_retrieve_s=out.latency_retrieve_s,
+                latency_llm_s=out.latency_llm_s,
+                prompt_text=getattr(out, "prompt_text", None),
+                memory_updates=getattr(out, "memory_updates", None),
+            )
+        )
 
     metrics = compute_metrics(records)
     mem_count = 0

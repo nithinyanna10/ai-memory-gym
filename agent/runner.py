@@ -5,8 +5,9 @@ from dataclasses import dataclass
 from typing import Optional
 
 from memory.base import MemoryItem, RetrievalResult
-from memory.policies import get_policy, PolicyContext, BrainState, create_brain_state, run_consolidation
+from memory.policies import BrainState, PolicyContext, create_brain_state, get_policy, run_consolidation
 from memory.embeddings import embed_text
+from memory.meta import snapshot_brain_state, summarize_snapshot
 from agent.llm import BaseLLM
 from agent.prompts import build_context_prompt, build_system_prompt
 
@@ -30,6 +31,7 @@ class StepOutput:
     latency_llm_s: float = 0.0
     prompt_text: Optional[str] = None
     memory_updates: Optional[list[dict]] = None  # [{"id": str, "text_snippet": str}]
+    meta_summary: Optional[dict] = None  # snapshot of meta-memory stats (for traces/UI)
 
 
 class AgentRunner:
@@ -121,7 +123,14 @@ class AgentRunner:
             if r.item.id and f"[{r.item.id}]" in answer:
                 citations.append(r.item.id)
 
-        if self.run_consolidation_at_end_of_day and self.policy_name in ("hybrid_brain", "rehearsal", "vector_rag"):
+        if self.run_consolidation_at_end_of_day and self.policy_name in (
+            "hybrid_brain",
+            "rehearsal",
+            "vector_rag",
+            "semantic_first",
+            "procedure_centric",
+            "long_term_focus",
+        ):
             if step.day > self._last_day_consolidated:
                 run_consolidation(
                     step.day,
@@ -133,6 +142,9 @@ class AgentRunner:
                 )
                 self._last_day_consolidated = step.day
 
+        meta = snapshot_brain_state(self.state, current_day=step.day)
+        meta_summary = summarize_snapshot(meta) if meta else None
+
         return StepOutput(
             answer=answer,
             citations=citations,
@@ -141,4 +153,5 @@ class AgentRunner:
             latency_llm_s=latency_llm,
             prompt_text=prompt,
             memory_updates=memory_updates,
+            meta_summary=meta_summary,
         )

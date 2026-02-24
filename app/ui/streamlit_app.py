@@ -84,11 +84,36 @@ DATA_DIR = ROOT / "data" / "runs"
 DATA_DIR.mkdir(parents=True, exist_ok=True)
 
 SCENARIO_OPTIONS = [
-    "personal_assistant", "personal_prefs", "research", "ops", "sales_crm",
-    "legal_contract", "meeting_memory", "multi_agent_handoff", "adversarial_injection",
-    "research_long", "ops_noisy_slack", "safety_pii", "tool_use_procedure",
+    "personal_assistant",
+    "personal_prefs",
+    "research",
+    "ops",
+    "sales_crm",
+    "legal_contract",
+    "meeting_memory",
+    "multi_agent_handoff",
+    "adversarial_injection",
+    "research_long",
+    "ops_noisy_slack",
+    "safety_pii",
+    "tool_use_procedure",
+    "coding_tutor",
+    "medical_consult",
+    "product_brain",
+    "multi_user_overlap",
 ]
-POLICY_OPTIONS = ["no_memory", "full_log", "rolling_summary", "vector_rag", "hybrid_brain", "salience_only", "rehearsal"]
+POLICY_OPTIONS = [
+    "no_memory",
+    "full_log",
+    "rolling_summary",
+    "vector_rag",
+    "hybrid_brain",
+    "salience_only",
+    "rehearsal",
+    "semantic_first",
+    "procedure_centric",
+    "long_term_focus",
+]
 
 
 # ---------- Sidebar: Experiment Builder ----------

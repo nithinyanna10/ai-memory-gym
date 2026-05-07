@@ -3,6 +3,7 @@
 import json
 from pathlib import Path
 from typing import Optional, Any
+from bench.logging_utils import run_log
 
 # Load from bench when needed to avoid circular imports
 def _load_result(path: str):
@@ -36,8 +37,9 @@ def leaderboard_rows_from_disk(data_dir: str) -> list[dict[str, Any]]:
                 "m_score": man.get("m_score"),
                 "tokens": man.get("token_estimate", 0),
             })
-        except Exception:
-            pass
+        except Exception as exc:
+            run_log("ui_manifest_parse_failed", level="warning", path=str(m_path), error=str(exc))
+    rows.sort(key=lambda r: (r.get("run_id") or "", r.get("scenario") or ""), reverse=True)
     return rows
 
 
@@ -61,9 +63,9 @@ def list_run_ids_from_disk(data_dir: str) -> list[tuple[str, Optional[str]]]:
                         if rid and rid not in run_ids:
                             p = data_dir / f"run_{rid}.json"
                             run_ids[rid] = str(p) if p.exists() else None
-                    except Exception:
-                        pass
-    return list(run_ids.items())
+                    except Exception as exc:
+                        run_log("ui_manifest_id_load_failed", level="warning", path=str(m), error=str(exc))
+    return sorted(run_ids.items(), key=lambda kv: kv[0], reverse=True)
 
 
 def load_result_from_disk(data_dir: str, run_id: str):

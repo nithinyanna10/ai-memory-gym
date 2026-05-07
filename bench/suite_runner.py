@@ -4,6 +4,8 @@ import hashlib
 import json
 import os
 import uuid
+import csv
+from concurrent.futures import ThreadPoolExecutor, as_completed
 from pathlib import Path
 from typing import Optional
 
@@ -142,82 +144,35 @@ def run_single_with_stress(config: BenchmarkConfig, run_id: Optional[str] = None
     return result
 
 
-def run_suite(suite_config: SuiteRunConfig, out_dir: str = "data/runs", use_cache: bool = True) -> SuiteRunResult:
-    """Run full suite; cache by config hash; output manifest + aggregated CSV/parquet."""
-    Path(out_dir).mkdir(parents=True, exist_ok=True)
-    results: list[BenchmarkResult] = []
+def _build_suite_configs(suite_config: SuiteRunConfig) -> list[BenchmarkConfig]:
+    configs: list[BenchmarkConfig] = []
     for policy in suite_config.policies:
         for scenario_type in suite_config.scenarios:
             for seed in suite_config.seeds:
                 for stress_mode in suite_config.stress_modes:
-                    config = BenchmarkConfig(
-                        scenario_type=scenario_type,
-                        policy=policy,
-                        seed=seed,
-                        number_of_days=suite_config.number_of_days,
-                        wm_size=suite_config.wm_size,
-                        top_k=suite_config.top_k,
-                        use_mock_llm=(suite_config.llm_mode != "real"),
-                        llm_mode=suite_config.llm_mode,
-                        stress_mode=stress_mode,
-                        stress_kwargs=suite_config.stress_kwargs,
+                    configs.append(
+                        BenchmarkConfig(
+                            scenario_type=scenario_type,
+                            policy=policy,
+                            seed=seed,
+                            number_of_days=suite_config.number_of_days,
+                            wm_size=suite_config.wm_size,
+                            top_k=suite_config.top_k,
+                            use_mock_llm=(suite_config.llm_mode != "real"),
+                            llm_mode=suite_config.llm_mode,
+                            stress_mode=stress_mode,
+                            stress_kwargs=suite_config.stress_kwargs,
+                        )
                     )
-                    ch = _config_hash(config)
-                    cache_path = Path(out_dir) / "cache" / f"{ch}.json"
-                    run_dir = Path(out_dir) / "runs"
-                    cached_run = False
-                    if use_cache and cache_path.exists():
-                        try:
-                            with open(cache_path) as f:
-                                cdata = json.load(f)
-                            run_id = cdata.get("run_id")
-                            run_file = Path(out_dir) / f"run_{run_id}.json"
-                            if run_file.exists():
-                                from bench.runner import load_result
-                                result = load_result(str(run_file))
-                                if not result.metrics_v2 and cdata.get("metrics_v2"):
-                                    result.metrics_v2 = cdata["metrics_v2"]
-                                run_dir_this = run_dir / run_id
-                                if not (run_dir_this / "manifest.json").exists():
-                                    write_run_artifacts(result, str(run_dir_this), cached=True)
-                                results.append(result)
-                                cached_run = True
-                                continue
-                        except Exception:
-                            pass
-                    if not cached_run:
-                        run_id_new = str(uuid.uuid4())[:8]
-                        run_dir_this = run_dir / run_id_new
-                        run_dir_this.mkdir(parents=True, exist_ok=True)
-                        set_run_log_path(str(run_dir_this / "run.log"))
-                        try:
-                            result = run_single_with_stress(config, run_id=run_id_new)
-                            results.append(result)
-                            save_result(result, out_dir)
-                            write_run_artifacts(result, str(run_dir_this), cached=False)
-                        finally:
-                            clear_run_log_path()
-                        if use_cache:
-                            cache_path.parent.mkdir(parents=True, exist_ok=True)
-                            with open(cache_path, "w") as f:
-                                json.dump({
-                                    "run_id": result.run_id,
-                                    "config_hash": ch,
-                                    "accuracy": result.accuracy,
-                                    "m_score": result.metrics_v2.get("m_score") if result.metrics_v2 else None,
-                                    "metrics_v2": result.metrics_v2,
-                                }, f, indent=2)
+    return configs
 
-    run_id = str(uuid.uuid4())[:8]
-    config_hash = hashlib.sha256(json.dumps({
-        "policies": suite_config.policies,
-        "scenarios": suite_config.scenarios,
-        "seeds": suite_config.seeds,
-        "stress_modes": suite_config.stress_modes,
-    }, sort_keys=True).encode()).hexdigest()[:16]
 
-    # Aggregated CSV
-    import pandas as pd
+def _write_aggregated_outputs(
+    results: list[BenchmarkResult],
+    out_dir: str,
+    run_id: str,
+    write_parquet: bool,
+) -> str:
     rows = []
     for r in results:
         row = {
@@ -229,19 +184,170 @@ def run_suite(suite_config: SuiteRunConfig, out_dir: str = "data/runs", use_cach
             "accuracy": r.accuracy,
             "token_estimate": r.token_estimate,
             "memory_items_stored": r.memory_items_stored,
+            "m_score": "",
+            "retention_half_life": "",
+            "contradiction_rate": "",
         }
         if r.metrics_v2:
-            row["m_score"] = r.metrics_v2.get("m_score")
-            row["retention_half_life"] = r.metrics_v2.get("retention_half_life")
-            row["contradiction_rate"] = r.metrics_v2.get("contradiction_rate")
+            row["m_score"] = r.metrics_v2.get("m_score", "")
+            row["retention_half_life"] = r.metrics_v2.get("retention_half_life", "")
+            row["contradiction_rate"] = r.metrics_v2.get("contradiction_rate", "")
         rows.append(row)
-    df = pd.DataFrame(rows)
+
     csv_path = os.path.join(out_dir, f"suite_{run_id}_aggregated.csv")
-    df.to_csv(csv_path, index=False)
+    fieldnames = [
+        "run_id",
+        "scenario",
+        "policy",
+        "seed",
+        "stress_mode",
+        "accuracy",
+        "token_estimate",
+        "memory_items_stored",
+        "m_score",
+        "retention_half_life",
+        "contradiction_rate",
+    ]
+    with open(csv_path, "w", newline="", encoding="utf-8") as fp:
+        writer = csv.DictWriter(fp, fieldnames=fieldnames)
+        writer.writeheader()
+        writer.writerows(rows)
+
+    if write_parquet:
+        try:
+            import pandas as pd
+
+            pd.DataFrame(rows).to_parquet(csv_path.replace(".csv", ".parquet"), index=False)
+        except Exception as exc:
+            run_log(
+                "suite_parquet_write_failed",
+                level="warning",
+                error=str(exc),
+                path=csv_path.replace(".csv", ".parquet"),
+            )
+    return csv_path
+
+
+def _run_uncached_suite_config(
+    config: BenchmarkConfig,
+    out_dir: str,
+    config_hash: str,
+    use_cache: bool,
+    write_parquet: bool,
+) -> BenchmarkResult:
+    run_id_new = str(uuid.uuid4())[:8]
+    run_dir_this = Path(out_dir) / "runs" / run_id_new
+    run_dir_this.mkdir(parents=True, exist_ok=True)
+    set_run_log_path(str(run_dir_this / "run.log"))
     try:
-        df.to_parquet(csv_path.replace(".csv", ".parquet"), index=False)
-    except Exception:
-        pass
+        result = run_single_with_stress(config, run_id=run_id_new)
+        save_result(result, out_dir, write_artifacts=False)
+        write_run_artifacts(result, str(run_dir_this), cached=False, write_parquet=write_parquet)
+    finally:
+        clear_run_log_path()
+
+    if use_cache:
+        cache_path = Path(out_dir) / "cache" / f"{config_hash}.json"
+        cache_path.parent.mkdir(parents=True, exist_ok=True)
+        with open(cache_path, "w", encoding="utf-8") as f:
+            json.dump(
+                {
+                    "run_id": result.run_id,
+                    "config_hash": config_hash,
+                    "accuracy": result.accuracy,
+                    "m_score": result.metrics_v2.get("m_score") if result.metrics_v2 else None,
+                    "metrics_v2": result.metrics_v2,
+                },
+                f,
+                indent=2,
+            )
+    return result
+
+
+def run_suite(suite_config: SuiteRunConfig, out_dir: str = "data/runs", use_cache: bool = True) -> SuiteRunResult:
+    """Run full suite; cache by config hash; output manifest + aggregated CSV/parquet."""
+    Path(out_dir).mkdir(parents=True, exist_ok=True)
+    run_dir = Path(out_dir) / "runs"
+    run_dir.mkdir(parents=True, exist_ok=True)
+    results: list[BenchmarkResult] = []
+    uncached: list[tuple[BenchmarkConfig, str]] = []
+    configs = _build_suite_configs(suite_config)
+
+    for config in configs:
+        ch = _config_hash(config)
+        cache_path = Path(out_dir) / "cache" / f"{ch}.json"
+        cached_run = False
+        if use_cache and cache_path.exists():
+            try:
+                with open(cache_path, encoding="utf-8") as f:
+                    cdata = json.load(f)
+                run_id = cdata.get("run_id")
+                run_file = Path(out_dir) / f"run_{run_id}.json"
+                if run_file.exists():
+                    from bench.runner import load_result
+
+                    result = load_result(str(run_file))
+                    if not result.metrics_v2 and cdata.get("metrics_v2"):
+                        result.metrics_v2 = cdata["metrics_v2"]
+                    run_dir_this = run_dir / run_id
+                    if not (run_dir_this / "manifest.json").exists():
+                        write_run_artifacts(result, str(run_dir_this), cached=True, write_parquet=suite_config.write_parquet)
+                    results.append(result)
+                    cached_run = True
+            except Exception as exc:
+                run_log(
+                    "cache_load_failed",
+                    level="warning",
+                    config_hash=ch,
+                    cache_path=str(cache_path),
+                    error=str(exc),
+                )
+        if not cached_run:
+            uncached.append((config, ch))
+
+    max_workers = max(1, int(suite_config.max_workers))
+    if uncached:
+        if max_workers == 1:
+            for config, ch in uncached:
+                results.append(
+                    _run_uncached_suite_config(
+                        config=config,
+                        out_dir=out_dir,
+                        config_hash=ch,
+                        use_cache=use_cache,
+                        write_parquet=suite_config.write_parquet,
+                    )
+                )
+        else:
+            with ThreadPoolExecutor(max_workers=max_workers) as executor:
+                futures = [
+                    executor.submit(
+                        _run_uncached_suite_config,
+                        config,
+                        out_dir,
+                        ch,
+                        use_cache,
+                        suite_config.write_parquet,
+                    )
+                    for config, ch in uncached
+                ]
+                for future in as_completed(futures):
+                    results.append(future.result())
+
+    run_id = str(uuid.uuid4())[:8]
+    config_hash = hashlib.sha256(json.dumps({
+        "policies": suite_config.policies,
+        "scenarios": suite_config.scenarios,
+        "seeds": suite_config.seeds,
+        "stress_modes": suite_config.stress_modes,
+    }, sort_keys=True).encode()).hexdigest()[:16]
+
+    csv_path = _write_aggregated_outputs(
+        results=results,
+        out_dir=out_dir,
+        run_id=run_id,
+        write_parquet=suite_config.write_parquet,
+    )
 
     manifest = {
         "suite_run_id": run_id,
@@ -254,7 +360,7 @@ def run_suite(suite_config: SuiteRunConfig, out_dir: str = "data/runs", use_cach
         "aggregated_csv": csv_path,
     }
     manifest_path = os.path.join(out_dir, f"suite_{run_id}_manifest.json")
-    with open(manifest_path, "w") as f:
+    with open(manifest_path, "w", encoding="utf-8") as f:
         json.dump(manifest, f, indent=2)
 
     return SuiteRunResult(
@@ -276,6 +382,11 @@ def load_suite_results(out_dir: str = "data/runs") -> list[dict]:
         try:
             with open(f) as fp:
                 out.append(json.load(fp))
-        except Exception:
-            pass
+        except Exception as exc:
+            run_log(
+                "suite_manifest_load_failed",
+                level="warning",
+                path=str(f),
+                error=str(exc),
+            )
     return out

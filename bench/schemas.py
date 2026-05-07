@@ -20,6 +20,25 @@ class BenchmarkConfig:
     stress_mode: Optional[str] = None  # None | corruption | distraction_flood | contradiction | distribution_shift
     stress_kwargs: dict = field(default_factory=dict)  # e.g. p_drop, k_noise, p_contradict, style_switch_day
 
+    def __post_init__(self) -> None:
+        if self.number_of_days <= 0:
+            raise ValueError("number_of_days must be > 0")
+        if self.wm_size <= 0:
+            raise ValueError("wm_size must be > 0")
+        if self.top_k <= 0:
+            raise ValueError("top_k must be > 0")
+        if not 0 <= self.salience_threshold <= 1:
+            raise ValueError("salience_threshold must be between 0 and 1")
+        if self.rehearsal_frequency <= 0:
+            raise ValueError("rehearsal_frequency must be > 0")
+        valid_llm_modes = {"mock", "rule", "real"}
+        if self.llm_mode not in valid_llm_modes:
+            raise ValueError(f"llm_mode must be one of {sorted(valid_llm_modes)}")
+        if self.stress_kwargs is None:
+            self.stress_kwargs = {}
+        elif not isinstance(self.stress_kwargs, dict):
+            raise ValueError("stress_kwargs must be a dict")
+
 
 @dataclass
 class RunRecord:
@@ -68,6 +87,8 @@ class SuiteRunConfig:
     llm_mode: str = "mock"
     wm_size: int = 10
     top_k: int = 5
+    max_workers: int = 1
+    write_parquet: bool = True
 
 
 @dataclass

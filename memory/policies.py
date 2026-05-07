@@ -118,26 +118,36 @@ def semantic_first(query: str, state: Optional[BrainState], ctx: PolicyContext) 
     wm_results = state.working.retrieve(query, top_k=min(2, ctx.top_k))
     proc_results = state.procedural.retrieve(query, top_k=min(2, ctx.top_k))
 
-    results: list[RetrievalResult] = []
+    tiered_results: list[tuple[int, RetrievalResult]] = []
     for r in sem_results:
         r.reason = "semantic_primary"
-        r.score *= 1.1
-        results.append(r)
+        tiered_results.append((0, r))
     for r in ep_results:
         # keep original reason from EpisodicMemory, just nudge a bit lower than semantic
         r.score *= 0.95
-        results.append(r)
+        tiered_results.append((1, r))
     for r in wm_results:
         r.reason = "working_context"
         r.score *= 0.9
-        results.append(r)
+        tiered_results.append((2, r))
     for r in proc_results:
         r.reason = "procedural_support"
         r.score *= 0.9
-        results.append(r)
+        tiered_results.append((3, r))
 
-    results.sort(key=lambda x: -x.score)
-    return results[: ctx.top_k]
+    # Deduplicate repeated items surfaced by different stores.
+    deduped: dict[str, tuple[int, RetrievalResult]] = {}
+    for tier, result in tiered_results:
+        existing = deduped.get(result.item.id)
+        if existing is None:
+            deduped[result.item.id] = (tier, result)
+            continue
+        existing_tier, existing_result = existing
+        if tier < existing_tier or (tier == existing_tier and result.score > existing_result.score):
+            deduped[result.item.id] = (tier, result)
+
+    ranked = [r for _, r in sorted(deduped.values(), key=lambda tr: (tr[0], -tr[1].score))]
+    return ranked[: ctx.top_k]
 
 
 def procedure_centric(query: str, state: Optional[BrainState], ctx: PolicyContext) -> list[RetrievalResult]:

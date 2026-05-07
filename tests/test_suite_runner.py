@@ -47,3 +47,21 @@ def test_suite_runner_produces_files():
         assert (run_dir / "traces.jsonl").exists()
         assert (run_dir / "metrics.json").exists()
         assert (run_dir / "summary.csv").exists()
+
+
+def test_suite_runner_parallel_and_no_parquet():
+    with tempfile.TemporaryDirectory() as tmp:
+        config = SuiteRunConfig(
+            policies=["full_log"],
+            scenarios=["personal_assistant"],
+            seeds=[42, 43],
+            number_of_days=2,
+            stress_modes=[None],
+            llm_mode="mock",
+            max_workers=2,
+            write_parquet=False,
+        )
+        result = run_suite(config, out_dir=tmp, use_cache=False)
+        assert len(result.results) == 2
+        assert result.aggregated_csv_path and os.path.exists(result.aggregated_csv_path)
+        assert not os.path.exists(result.aggregated_csv_path.replace(".csv", ".parquet"))

@@ -2,14 +2,21 @@
 
 import json
 import os
+import csv
 from pathlib import Path
 from typing import Optional
 
 from bench.schemas import BenchmarkResult, RunRecord
 from bench.experiment_config import RunManifest, stable_config_hash
+from bench.logging_utils import run_log
 
 
-def write_run_artifacts(result: BenchmarkResult, run_dir: str, cached: bool = False) -> dict:
+def write_run_artifacts(
+    result: BenchmarkResult,
+    run_dir: str,
+    cached: bool = False,
+    write_parquet: bool = True,
+) -> dict:
     """Write manifest.json, traces.jsonl, metrics.json, summary.csv, summary.parquet under run_dir. Returns artifact paths."""
     Path(run_dir).mkdir(parents=True, exist_ok=True)
     run_id = result.run_id or "unknown"
@@ -45,13 +52,13 @@ def write_run_artifacts(result: BenchmarkResult, run_dir: str, cached: bool = Fa
         artifacts={},
     )
     manifest_path = os.path.join(run_dir, "manifest.json")
-    with open(manifest_path, "w") as f:
+    with open(manifest_path, "w", encoding="utf-8") as f:
         f.write(manifest.model_dump_json(indent=2))
     manifest.artifacts["manifest"] = manifest_path
 
     # traces.jsonl (one line per step)
     traces_path = os.path.join(run_dir, "traces.jsonl")
-    with open(traces_path, "w") as f:
+    with open(traces_path, "w", encoding="utf-8") as f:
         for idx, r in enumerate(result.run_records):
             trace = {
                 "step_index": idx,
@@ -87,15 +94,13 @@ def write_run_artifacts(result: BenchmarkResult, run_dir: str, cached: bool = Fa
     }
     if result.metrics_v2:
         metrics["v2"] = result.metrics_v2
-    with open(metrics_path, "w") as f:
+    with open(metrics_path, "w", encoding="utf-8") as f:
         json.dump(metrics, f, indent=2)
     manifest.artifacts["metrics"] = metrics_path
 
-    # summary.csv and summary.parquet
-    import pandas as pd
-    rows = []
-    for r in result.run_records:
-        rows.append({
+    # summary.csv (always) and summary.parquet (optional)
+    rows = [
+        {
             "run_id": run_id,
             "day": r.day,
             "turn": r.turn,
@@ -106,23 +111,42 @@ def write_run_artifacts(result: BenchmarkResult, run_dir: str, cached: bool = Fa
             "citation_precision": r.citation_precision,
             "citation_recall": r.citation_recall,
             "latency_retrieve_s": r.latency_retrieve_s,
-        })
-    df = pd.DataFrame(rows)
+        }
+        for r in result.run_records
+    ]
     summary_csv = os.path.join(run_dir, "summary.csv")
-    df.to_csv(summary_csv, index=False)
+    fieldnames = [
+        "run_id",
+        "day",
+        "turn",
+        "question",
+        "gold_answer",
+        "answer",
+        "correct",
+        "citation_precision",
+        "citation_recall",
+        "latency_retrieve_s",
+    ]
+    with open(summary_csv, "w", newline="", encoding="utf-8") as fp:
+        writer = csv.DictWriter(fp, fieldnames=fieldnames)
+        writer.writeheader()
+        writer.writerows(rows)
     manifest.artifacts["summary_csv"] = summary_csv
-    try:
-        summary_parquet = os.path.join(run_dir, "summary.parquet")
-        df.to_parquet(summary_parquet, index=False)
-        manifest.artifacts["summary_parquet"] = summary_parquet
-    except Exception:
-        pass
+    if write_parquet:
+        try:
+            import pandas as pd
+
+            summary_parquet = os.path.join(run_dir, "summary.parquet")
+            pd.DataFrame(rows).to_parquet(summary_parquet, index=False)
+            manifest.artifacts["summary_parquet"] = summary_parquet
+        except Exception as exc:
+            run_log("run_parquet_write_failed", level="warning", run_id=run_id, error=str(exc))
     run_log_path = os.path.join(run_dir, "run.log")
     if os.path.exists(run_log_path):
         manifest.artifacts["run_log"] = run_log_path
 
     # Update manifest with artifact paths and write again
-    with open(manifest_path, "w") as f:
+    with open(manifest_path, "w", encoding="utf-8") as f:
         f.write(manifest.model_dump_json(indent=2))
 
     return dict(manifest.artifacts)
